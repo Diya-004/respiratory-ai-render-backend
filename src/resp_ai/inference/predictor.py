@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import tempfile
 import zipfile
 from pathlib import Path
@@ -112,6 +113,7 @@ class Predictor:
         self.config = load_yaml(self.config_path)
         self.audio_config = load_audio_config(self.config)
         self.inference_config = load_inference_config(self.config)
+        self.enable_gradcam = os.environ.get("RESP_AI_ENABLE_GRADCAM", "").lower() in {"1", "true", "yes"}
 
         if model_path is None:
             model_path = resolve_project_path(self.project_root, self.config["paths"]["models_root"]) / "latest" / "best_model.keras"
@@ -119,13 +121,15 @@ class Predictor:
         self.model = load_model_with_compat(self.model_path)
         self.class_names = self._load_class_names()
         self.last_conv_layer_name = self._find_last_conv_layer()
-        self.grad_model = tf.keras.models.Model(
-            inputs=self.model.inputs,
-            outputs=[
-                self.model.get_layer(self.last_conv_layer_name).output,
-                self._prediction_output_tensor(),
-            ],
-        )
+        self.grad_model = None
+        if self.enable_gradcam:
+            self.grad_model = tf.keras.models.Model(
+                inputs=self.model.inputs,
+                outputs=[
+                    self.model.get_layer(self.last_conv_layer_name).output,
+                    self._prediction_output_tensor(),
+                ],
+            )
 
     def _load_class_names(self) -> list[str]:
         class_names_path = self.model_path.parent / "class_names.json"
@@ -310,6 +314,9 @@ class Predictor:
         }
 
     def _gradcam_data_url(self, batch: np.ndarray, class_index: int) -> str:
+        if not self.enable_gradcam or self.grad_model is None:
+            return self._lightweight_heatmap_data_url(batch)
+
         with tf.GradientTape() as tape:
             conv_output, predictions = self.grad_model(batch, training=False)
             loss = predictions[:, class_index]
@@ -338,6 +345,27 @@ class Predictor:
             axis=-1,
         )
         alpha = (heatmap[..., np.newaxis] * 0.55).astype(np.float32)
+        blended = np.clip((base_rgb * (1.0 - alpha)) + (accent * alpha), 0.0, 1.0)
+        png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
+        encoded = base64.b64encode(png_bytes).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+
+    def _lightweight_heatmap_data_url(self, batch: np.ndarray) -> str:
+        base_image = np.clip(batch[0][:, :, 0].astype(np.float32), 0.0, 1.0)
+        time_energy = base_image.mean(axis=0)
+        time_energy = (time_energy - time_energy.min()) / (time_energy.max() - time_energy.min() + 1e-6)
+        focus_map = np.repeat(time_energy[np.newaxis, :], base_image.shape[0], axis=0)
+
+        base_rgb = np.repeat(base_image[..., np.newaxis], 3, axis=-1)
+        accent = np.stack(
+            [
+                focus_map * 0.25,
+                focus_map * 0.7,
+                focus_map,
+            ],
+            axis=-1,
+        )
+        alpha = (focus_map[..., np.newaxis] * 0.42).astype(np.float32)
         blended = np.clip((base_rgb * (1.0 - alpha)) + (accent * alpha), 0.0, 1.0)
         png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
         encoded = base64.b64encode(png_bytes).decode("utf-8")
