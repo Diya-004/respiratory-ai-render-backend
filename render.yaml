@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: respiratory-ai-backend
+    runtime: docker
+    plan: free
+    autoDeployTrigger: commit
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /ready

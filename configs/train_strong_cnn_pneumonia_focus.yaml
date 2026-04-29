@@ -1,0 +1,54 @@
+paths:
+  data_root: dataset_final_pneumonia_focus
+  models_root: models_strong_cnn_pneumonia_focus
+
+audio:
+  sample_rate: 4000
+  duration_seconds: 5.0
+  trim_top_db: 30
+  n_mels: 128
+  n_fft: 512
+  hop_length: 128
+  fmin: 50
+  fmax: 2000
+  use_deltas: true
+
+train:
+  seed: 42
+  batch_size: 16
+  epochs: 60
+  learning_rate: 0.0001
+  label_smoothing: 0.0
+  architecture: strong_cnn
+  dropout: 0.35
+  dense_units: 256
+  freeze_backbone: false
+  model_name: respiratory_classifier_strong_cnn_pneumonia_focus
+  class_weight_strategy: sqrt_balanced_clipped
+  class_weight_min: 0.5
+  class_weight_max: 3.0
+  class_weight_overrides:
+    Asthma: 1.1
+    Pneumonia: 1.75
+  online_augmentation: false
+  loss_name: focal
+  focal_gamma: 1.5
+
+inference:
+  aggregation: pneumonia_sensitive
+  window_overlap: 0.5
+  max_windows: 5
+
+app:
+  host: 0.0.0.0
+  port: 8080
+  allowed_extensions:
+    - .wav
+    - .mp3
+    - .flac
+    - .ogg
+    - .m4a
+    - .aac
+    - .3gp
+    - .mp4
+    - .webm
