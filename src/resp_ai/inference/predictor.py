@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 import tempfile
 import zipfile
 from pathlib import Path
 
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 
@@ -16,8 +13,6 @@ from resp_ai.config import load_audio_config, load_inference_config, load_yaml
 from resp_ai.features.audio import extract_window_batch_from_path
 from resp_ai.labels import CLASS_NAMES
 from resp_ai.paths import project_root_from_config, resolve_project_path
-
-matplotlib.use("Agg")
 
 LEGACY_KERAS_MODULE_MAP = {
     "keras.src.engine.functional": "keras.src.models.functional",
@@ -124,6 +119,13 @@ class Predictor:
         self.model = load_model_with_compat(self.model_path)
         self.class_names = self._load_class_names()
         self.last_conv_layer_name = self._find_last_conv_layer()
+        self.grad_model = tf.keras.models.Model(
+            inputs=self.model.inputs,
+            outputs=[
+                self.model.get_layer(self.last_conv_layer_name).output,
+                self._prediction_output_tensor(),
+            ],
+        )
 
     def _load_class_names(self) -> list[str]:
         class_names_path = self.model_path.parent / "class_names.json"
@@ -308,16 +310,8 @@ class Predictor:
         }
 
     def _gradcam_data_url(self, batch: np.ndarray, class_index: int) -> str:
-        grad_model = tf.keras.models.Model(
-            inputs=self.model.inputs,
-            outputs=[
-                self.model.get_layer(self.last_conv_layer_name).output,
-                self._prediction_output_tensor(),
-            ],
-        )
-
         with tf.GradientTape() as tape:
-            conv_output, predictions = grad_model(batch, training=False)
+            conv_output, predictions = self.grad_model(batch, training=False)
             loss = predictions[:, class_index]
 
         gradients = tape.gradient(loss, conv_output)
@@ -326,19 +320,25 @@ class Predictor:
         heatmap = conv_output @ pooled_gradients[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
         heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-6)
-        heatmap = heatmap.numpy()
+        base_image = np.clip(batch[0][:, :, 0].astype(np.float32), 0.0, 1.0)
+        heatmap = tf.image.resize(
+            heatmap[tf.newaxis, ..., tf.newaxis],
+            size=base_image.shape,
+            method="bilinear",
+        )[0, :, :, 0].numpy()
+        heatmap = np.clip(heatmap, 0.0, 1.0)
 
-        base_image = batch[0][:, :, 0]
-        fig, ax = plt.subplots(figsize=(8, 3), dpi=140)
-        ax.imshow(base_image, origin="lower", aspect="auto", cmap="gray")
-        ax.imshow(heatmap, origin="lower", aspect="auto", cmap="jet", alpha=0.45, extent=(0, base_image.shape[1], 0, base_image.shape[0]))
-        ax.set_title("Model attention heatmap")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Mel bin")
-        fig.tight_layout()
-
-        buffer = io.BytesIO()
-        fig.savefig(buffer, format="png")
-        plt.close(fig)
-        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        base_rgb = np.repeat(base_image[..., np.newaxis], 3, axis=-1)
+        accent = np.stack(
+            [
+                heatmap,
+                np.sqrt(heatmap),
+                np.power(heatmap, 3),
+            ],
+            axis=-1,
+        )
+        alpha = (heatmap[..., np.newaxis] * 0.55).astype(np.float32)
+        blended = np.clip((base_rgb * (1.0 - alpha)) + (accent * alpha), 0.0, 1.0)
+        png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
+        encoded = base64.b64encode(png_bytes).decode("utf-8")
         return f"data:image/png;base64,{encoded}"

@@ -6,17 +6,12 @@ import random
 from typing import Optional
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/resp_ai_numba_cache")
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/resp_ai_mplconfig")
 
 import librosa
-import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 
 from resp_ai.config import AudioConfig
-
-matplotlib.use("Agg")
 
 
 def trim_normalize_signal(signal: np.ndarray, config: AudioConfig) -> np.ndarray:
@@ -248,6 +243,11 @@ def save_preprocessed_clip(src_path: str, dst_path: str, config: AudioConfig) ->
 
 
 def render_feature_heatmap(image: np.ndarray, title: Optional[str] = None) -> bytes:
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/resp_ai_mplconfig")
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.use("Agg")
     fig, ax = plt.subplots(figsize=(8, 3), dpi=140)
     ax.imshow(image[:, :, 0], origin="lower", aspect="auto", cmap="magma")
     ax.set_xlabel("Time")
