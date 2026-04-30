@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import random
+from dataclasses import dataclass
 from typing import Optional
 
 os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/resp_ai_numba_cache")
@@ -12,6 +13,56 @@ import numpy as np
 import soundfile as sf
 
 from resp_ai.config import AudioConfig
+
+RESPIRATORY_REFERENCE_MEL_PROFILE = np.array(
+    [
+        0.99727967,
+        0.00254150,
+        0.00006920,
+        0.00003953,
+        0.00002061,
+        0.00001423,
+        0.00001037,
+        0.00000789,
+        0.00000606,
+        0.00000473,
+        0.00000404,
+        0.00000182,
+        0.00000021,
+        0.00000008,
+        0.00000004,
+        0.00000002,
+    ],
+    dtype=np.float32,
+)
+
+
+@dataclass(frozen=True)
+class RespiratoryAudioCheck:
+    accepted: bool
+    similarity: float
+    duration_sec: float
+    spectral_centroid_hz: float
+    spectral_rolloff_hz: float
+    zero_crossing_rate: float
+    band_low_ratio: float
+    band_mid_ratio: float
+    band_high_ratio: float
+    reasons: list[str]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "accepted": self.accepted,
+            "similarity": round(self.similarity, 4),
+            "duration_sec": round(self.duration_sec, 4),
+            "spectral_centroid_hz": round(self.spectral_centroid_hz, 2),
+            "spectral_rolloff_hz": round(self.spectral_rolloff_hz, 2),
+            "zero_crossing_rate": round(self.zero_crossing_rate, 5),
+            "band_low_ratio": round(self.band_low_ratio, 4),
+            "band_mid_ratio": round(self.band_mid_ratio, 4),
+            "band_high_ratio": round(self.band_high_ratio, 4),
+            "reasons": self.reasons,
+        }
 
 
 def trim_normalize_signal(signal: np.ndarray, config: AudioConfig) -> np.ndarray:
@@ -126,6 +177,77 @@ def extract_window_batch_from_path(
         )
 
     return np.stack(images, axis=0).astype(np.float32), metadata
+
+
+def assess_respiratory_audio(path: str, config: AudioConfig) -> RespiratoryAudioCheck:
+    signal = load_trimmed_audio(path, config)
+    duration_sec = len(signal) / max(config.sample_rate, 1)
+
+    mel = librosa.feature.melspectrogram(
+        y=signal,
+        sr=config.sample_rate,
+        n_mels=len(RESPIRATORY_REFERENCE_MEL_PROFILE),
+        n_fft=config.n_fft,
+        hop_length=config.hop_length,
+        fmin=max(20.0, float(config.fmin)),
+        fmax=min(4000.0, float(config.fmax)),
+        power=2.0,
+    )
+    mel_profile = mel.mean(axis=1).astype(np.float32)
+    mel_profile_sum = float(mel_profile.sum()) + 1e-8
+    mel_profile = mel_profile / mel_profile_sum
+    similarity = _cosine_similarity(mel_profile, RESPIRATORY_REFERENCE_MEL_PROFILE)
+
+    spectrum = np.abs(librosa.stft(signal, n_fft=config.n_fft, hop_length=config.hop_length)) + 1e-8
+    freqs = librosa.fft_frequencies(sr=config.sample_rate, n_fft=config.n_fft)
+    total_magnitude = float(spectrum.sum()) + 1e-8
+
+    def band_ratio(low_hz: float, high_hz: float) -> float:
+        mask = (freqs >= low_hz) & (freqs < high_hz)
+        return float(spectrum[mask].sum() / total_magnitude)
+
+    spectral_centroid_hz = float(librosa.feature.spectral_centroid(S=spectrum, sr=config.sample_rate).mean())
+    spectral_rolloff_hz = float(
+        librosa.feature.spectral_rolloff(S=spectrum, sr=config.sample_rate, roll_percent=0.85).mean()
+    )
+    zero_crossing_rate = float(librosa.feature.zero_crossing_rate(signal).mean())
+    band_low_ratio = band_ratio(0.0, 250.0)
+    band_mid_ratio = band_ratio(250.0, 2500.0)
+    band_high_ratio = band_ratio(2500.0, config.sample_rate / 2.0)
+
+    reasons: list[str] = []
+    if duration_sec < 1.5:
+        reasons.append("The usable part of this recording is too short after trimming silence.")
+    if similarity < 0.62:
+        reasons.append("This file does not resemble the respiratory recordings used to train the model.")
+    if band_low_ratio < 0.40 and band_mid_ratio > 0.45:
+        reasons.append("Most of the audio energy sits outside the low-frequency respiratory band expected by this model.")
+    if (
+        spectral_centroid_hz > 1800.0
+        or spectral_rolloff_hz > 3200.0
+        or zero_crossing_rate > 0.15
+        or band_high_ratio > 0.30
+    ):
+        reasons.append("The clip contains too much bright or rapidly changing content for a respiratory-only recording.")
+
+    return RespiratoryAudioCheck(
+        accepted=not reasons,
+        similarity=similarity,
+        duration_sec=duration_sec,
+        spectral_centroid_hz=spectral_centroid_hz,
+        spectral_rolloff_hz=spectral_rolloff_hz,
+        zero_crossing_rate=zero_crossing_rate,
+        band_low_ratio=band_low_ratio,
+        band_mid_ratio=band_mid_ratio,
+        band_high_ratio=band_high_ratio,
+        reasons=reasons,
+    )
+
+
+def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    numerator = float(np.dot(left, right))
+    denominator = float(np.linalg.norm(left) * np.linalg.norm(right)) + 1e-8
+    return numerator / denominator
 
 
 def _time_shift(signal: np.ndarray, max_fraction: float) -> np.ndarray:
@@ -258,6 +380,34 @@ def render_feature_heatmap(image: np.ndarray, title: Optional[str] = None) -> by
 
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def render_attention_heatmap(heatmap: np.ndarray, title: Optional[str] = None) -> bytes:
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/resp_ai_mplconfig")
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.use("Agg")
+    fig, ax = plt.subplots(figsize=(8.2, 3.1), dpi=160)
+    ax.imshow(
+        heatmap,
+        origin="lower",
+        aspect="auto",
+        cmap="viridis",
+        interpolation="nearest",
+        vmin=0.0,
+        vmax=1.0,
+    )
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Mel bin")
+    ax.set_title(title or "Model attention heatmap")
+    fig.tight_layout()
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", facecolor="white")
     plt.close(fig)
     buffer.seek(0)
     return buffer.read()

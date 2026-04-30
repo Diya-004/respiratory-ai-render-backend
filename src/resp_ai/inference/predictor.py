@@ -11,13 +11,24 @@ import numpy as np
 import tensorflow as tf
 
 from resp_ai.config import load_audio_config, load_inference_config, load_yaml
-from resp_ai.features.audio import extract_window_batch_from_path
+from resp_ai.features.audio import assess_respiratory_audio, extract_window_batch_from_path, render_attention_heatmap
 from resp_ai.labels import CLASS_NAMES
 from resp_ai.paths import project_root_from_config, resolve_project_path
 
 LEGACY_KERAS_MODULE_MAP = {
     "keras.src.engine.functional": "keras.src.models.functional",
 }
+
+
+class UnsupportedRespiratoryAudioError(ValueError):
+    pass
+
+
+def _env_flag_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def _strip_null_quantization_config(value):
@@ -113,7 +124,8 @@ class Predictor:
         self.config = load_yaml(self.config_path)
         self.audio_config = load_audio_config(self.config)
         self.inference_config = load_inference_config(self.config)
-        self.enable_gradcam = os.environ.get("RESP_AI_ENABLE_GRADCAM", "").lower() in {"1", "true", "yes"}
+        running_in_hf_space = bool(os.environ.get("SPACE_ID") or os.environ.get("SPACE_HOST"))
+        self.enable_gradcam = _env_flag_enabled("RESP_AI_ENABLE_GRADCAM", default=running_in_hf_space)
 
         if model_path is None:
             model_path = resolve_project_path(self.project_root, self.config["paths"]["models_root"]) / "latest" / "best_model.keras"
@@ -162,6 +174,10 @@ class Predictor:
         return outputs[0]
 
     def predict_path(self, audio_path: str | Path, filename: str) -> dict:
+        input_check = assess_respiratory_audio(str(audio_path), self.audio_config)
+        if not input_check.accepted:
+            raise UnsupportedRespiratoryAudioError(self._unsupported_audio_message(input_check.reasons))
+
         batch, window_metadata = extract_window_batch_from_path(
             str(audio_path),
             self.audio_config,
@@ -215,6 +231,7 @@ class Predictor:
             "window_overlap": self.inference_config.window_overlap,
             "representative_window": windows[representative_window_index],
             "window_predictions": windows,
+            "input_check": input_check.as_dict(),
         }
 
     def _aggregate_window_probabilities(self, window_probs: np.ndarray) -> np.ndarray:
@@ -319,34 +336,32 @@ class Predictor:
 
         with tf.GradientTape() as tape:
             conv_output, predictions = self.grad_model(batch, training=False)
-            loss = predictions[:, class_index]
+            loss = tf.math.log(predictions[:, class_index] + 1e-8)
 
         gradients = tape.gradient(loss, conv_output)
-        pooled_gradients = tf.reduce_mean(gradients, axis=(0, 1, 2))
-        conv_output = conv_output[0]
-        heatmap = conv_output @ pooled_gradients[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-6)
+        if gradients is None:
+            return self._lightweight_heatmap_data_url(batch)
+
+        guided_gradients = (
+            tf.cast(conv_output > 0, tf.float32)
+            * tf.cast(gradients > 0, tf.float32)
+            * gradients
+        )
+        pooled_gradients = tf.reduce_mean(guided_gradients, axis=(0, 1, 2)).numpy()
+        conv_output = conv_output[0].numpy()
+        heatmap = np.tensordot(conv_output, pooled_gradients, axes=([2], [0]))
+        heatmap = np.maximum(heatmap, 0.0)
+        heatmap = heatmap / (float(np.max(heatmap)) + 1e-6)
         base_image = np.clip(batch[0][:, :, 0].astype(np.float32), 0.0, 1.0)
         heatmap = tf.image.resize(
-            heatmap[tf.newaxis, ..., tf.newaxis],
+            heatmap[np.newaxis, ..., np.newaxis],
             size=base_image.shape,
             method="bilinear",
         )[0, :, :, 0].numpy()
         heatmap = np.clip(heatmap, 0.0, 1.0)
 
-        base_rgb = np.repeat(base_image[..., np.newaxis], 3, axis=-1)
-        accent = np.stack(
-            [
-                heatmap,
-                np.sqrt(heatmap),
-                np.power(heatmap, 3),
-            ],
-            axis=-1,
-        )
-        alpha = (heatmap[..., np.newaxis] * 0.55).astype(np.float32)
-        blended = np.clip((base_rgb * (1.0 - alpha)) + (accent * alpha), 0.0, 1.0)
-        png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
+        heatmap = np.power(heatmap, 0.9).astype(np.float32)
+        png_bytes = render_attention_heatmap(heatmap, title="Model attention heatmap")
         encoded = base64.b64encode(png_bytes).decode("utf-8")
         return f"data:image/png;base64,{encoded}"
 
@@ -370,3 +385,10 @@ class Predictor:
         png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
         encoded = base64.b64encode(png_bytes).decode("utf-8")
         return f"data:image/png;base64,{encoded}"
+
+    def _unsupported_audio_message(self, reasons: list[str]) -> str:
+        primary_reason = reasons[0] if reasons else "This file does not resemble the respiratory recordings used to train the model."
+        return (
+            f"{primary_reason} Please upload a clean breathing or lung-sound clip recorded in a quiet place. "
+            "Music, songs, speech, and unrelated background audio are intentionally blocked."
+        )
