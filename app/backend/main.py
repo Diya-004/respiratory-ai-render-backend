@@ -28,6 +28,21 @@ _predictor: Predictor | None = None
 _predictor_load_error: str | None = None
 
 
+@app.get("/")
+def index() -> tuple[dict, int]:
+    return {
+        "service": "Respiratory AI Backend",
+        "status": "online",
+        "message": "Use /ready to verify the model, /health for service metadata, and /predict to analyze an audio file.",
+        "endpoints": {
+            "root": "/",
+            "health": "/health",
+            "ready": "/ready",
+            "predict": "/predict",
+        },
+    }, 200
+
+
 def resolve_active_model_path() -> Path:
     model_path = os.environ.get("RESP_AI_MODEL")
     if model_path:
