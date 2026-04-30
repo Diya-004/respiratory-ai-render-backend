@@ -387,7 +387,11 @@ class Predictor:
         return f"data:image/png;base64,{encoded}"
 
     def _unsupported_audio_message(self, reasons: list[str]) -> str:
-        primary_reason = reasons[0] if reasons else "This file does not resemble the respiratory recordings used to train the model."
+        primary_reason = (
+            reasons[0]
+            if reasons
+            else "This file does not resemble the respiratory recordings used to train the model."
+        )
         return (
             f"{primary_reason} Please upload a clean breathing or lung-sound clip recorded in a quiet place. "
             "Music, songs, speech, and unrelated background audio are intentionally blocked."

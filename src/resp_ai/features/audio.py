@@ -45,6 +45,8 @@ class RespiratoryAudioCheck:
     spectral_centroid_hz: float
     spectral_rolloff_hz: float
     zero_crossing_rate: float
+    voiced_fraction: float
+    voiced_confidence: float
     band_low_ratio: float
     band_mid_ratio: float
     band_high_ratio: float
@@ -58,6 +60,8 @@ class RespiratoryAudioCheck:
             "spectral_centroid_hz": round(self.spectral_centroid_hz, 2),
             "spectral_rolloff_hz": round(self.spectral_rolloff_hz, 2),
             "zero_crossing_rate": round(self.zero_crossing_rate, 5),
+            "voiced_fraction": round(self.voiced_fraction, 4),
+            "voiced_confidence": round(self.voiced_confidence, 4),
             "band_low_ratio": round(self.band_low_ratio, 4),
             "band_mid_ratio": round(self.band_mid_ratio, 4),
             "band_high_ratio": round(self.band_high_ratio, 4),
@@ -211,20 +215,32 @@ def assess_respiratory_audio(path: str, config: AudioConfig) -> RespiratoryAudio
         librosa.feature.spectral_rolloff(S=spectrum, sr=config.sample_rate, roll_percent=0.85).mean()
     )
     zero_crossing_rate = float(librosa.feature.zero_crossing_rate(signal).mean())
+    _, voiced_flags, voiced_probs = librosa.pyin(
+        signal,
+        sr=config.sample_rate,
+        fmin=50,
+        fmax=min(1000, config.sample_rate // 2 - 1),
+        frame_length=config.n_fft,
+        hop_length=config.hop_length,
+    )
+    voiced_fraction = float(np.mean(np.nan_to_num(voiced_flags.astype(np.float32))))
+    voiced_confidence = float(np.nanmean(np.nan_to_num(voiced_probs)))
     band_low_ratio = band_ratio(0.0, 250.0)
     band_mid_ratio = band_ratio(250.0, 2500.0)
     band_high_ratio = band_ratio(2500.0, config.sample_rate / 2.0)
 
     reasons: list[str] = []
-    if duration_sec < 1.5:
+    if duration_sec < 1.2:
         reasons.append("The usable part of this recording is too short after trimming silence.")
-    if similarity < 0.62:
+    if voiced_fraction > 0.82 and voiced_confidence > 0.65:
+        reasons.append("This recording sounds more like music, singing, or sustained speech than breathing audio.")
+    if similarity < 0.42 and band_low_ratio < 0.18 and band_mid_ratio > 0.55:
         reasons.append("This file does not resemble the respiratory recordings used to train the model.")
-    if band_low_ratio < 0.40 and band_mid_ratio > 0.45:
+    if band_low_ratio < 0.12 and band_mid_ratio > 0.70:
         reasons.append("Most of the audio energy sits outside the low-frequency respiratory band expected by this model.")
     if (
-        spectral_centroid_hz > 1800.0
-        or spectral_rolloff_hz > 3200.0
+        spectral_centroid_hz > 2500.0
+        or spectral_rolloff_hz > 4000.0
         or zero_crossing_rate > 0.15
         or band_high_ratio > 0.30
     ):
@@ -237,6 +253,8 @@ def assess_respiratory_audio(path: str, config: AudioConfig) -> RespiratoryAudio
         spectral_centroid_hz=spectral_centroid_hz,
         spectral_rolloff_hz=spectral_rolloff_hz,
         zero_crossing_rate=zero_crossing_rate,
+        voiced_fraction=voiced_fraction,
+        voiced_confidence=voiced_confidence,
         band_low_ratio=band_low_ratio,
         band_mid_ratio=band_mid_ratio,
         band_high_ratio=band_high_ratio,
