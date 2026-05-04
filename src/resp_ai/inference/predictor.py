@@ -11,17 +11,13 @@ import numpy as np
 import tensorflow as tf
 
 from resp_ai.config import load_audio_config, load_inference_config, load_yaml
-from resp_ai.features.audio import assess_respiratory_audio, extract_window_batch_from_path, render_attention_heatmap
+from resp_ai.features.audio import extract_window_batch_from_path, render_attention_heatmap
 from resp_ai.labels import CLASS_NAMES
 from resp_ai.paths import project_root_from_config, resolve_project_path
 
 LEGACY_KERAS_MODULE_MAP = {
     "keras.src.engine.functional": "keras.src.models.functional",
 }
-
-
-class UnsupportedRespiratoryAudioError(ValueError):
-    pass
 
 
 def _env_flag_enabled(name: str, default: bool = False) -> bool:
@@ -174,10 +170,6 @@ class Predictor:
         return outputs[0]
 
     def predict_path(self, audio_path: str | Path, filename: str) -> dict:
-        input_check = assess_respiratory_audio(str(audio_path), self.audio_config)
-        if not input_check.accepted:
-            raise UnsupportedRespiratoryAudioError(self._unsupported_audio_message(input_check.reasons))
-
         batch, window_metadata = extract_window_batch_from_path(
             str(audio_path),
             self.audio_config,
@@ -231,7 +223,6 @@ class Predictor:
             "window_overlap": self.inference_config.window_overlap,
             "representative_window": windows[representative_window_index],
             "window_predictions": windows,
-            "input_check": input_check.as_dict(),
         }
 
     def _aggregate_window_probabilities(self, window_probs: np.ndarray) -> np.ndarray:
@@ -385,14 +376,3 @@ class Predictor:
         png_bytes = tf.io.encode_png((blended * 255.0).astype(np.uint8)).numpy()
         encoded = base64.b64encode(png_bytes).decode("utf-8")
         return f"data:image/png;base64,{encoded}"
-
-    def _unsupported_audio_message(self, reasons: list[str]) -> str:
-        primary_reason = (
-            reasons[0]
-            if reasons
-            else "This file does not resemble the respiratory recordings used to train the model."
-        )
-        return (
-            f"{primary_reason} Please upload a clean breathing or lung-sound clip recorded in a quiet place. "
-            "Music, songs, speech, and unrelated background audio are intentionally blocked."
-        )

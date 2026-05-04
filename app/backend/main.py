@@ -14,7 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from resp_ai.config import load_app_config, load_yaml
-from resp_ai.inference.predictor import Predictor, UnsupportedRespiratoryAudioError
+from resp_ai.inference.predictor import Predictor
 from resp_ai.paths import resolve_project_path
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "train_strong_cnn_pneumonia_focus.yaml"
@@ -145,8 +145,6 @@ def predict():
             temp_path = Path(handle.name)
 
         result = get_predictor().predict_path(temp_path, filename)
-    except UnsupportedRespiratoryAudioError as exc:
-        return jsonify({"error": str(exc), "error_code": "unsupported_audio"}), 400
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 503
     except Exception as exc:
